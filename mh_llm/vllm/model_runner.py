@@ -1,5 +1,6 @@
 from typing import TYPE_CHECKING, Optional, Union
 
+import numpy as np
 import torch
 from typing_extensions import TypeAlias
 
@@ -15,14 +16,16 @@ from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.sequence import IntermediateTensors
-from vllm.v1.attention.backends.flash_attn import AttentionMetadata
+try:
+    from vllm.v1.attention.backends.flash_attn import AttentionMetadata
+except ImportError:
+    from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata as AttentionMetadata  # vllm >= 0.11.2
 # yapf: enable
 from vllm.v1.outputs import (
     LogprobsLists,
     LogprobsTensors,
     AsyncModelRunnerOutput,
 )
-from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 
@@ -78,25 +81,49 @@ class GPUModelRunner(BaseGPUModelRunner):
               "it when the requests need prompt logprobs")
 
         # Prepare the decoder inputs.
-        (attn_metadata, logits_indices, spec_decode_metadata,
-         num_scheduled_tokens_np, spec_decode_common_attn_metadata,
-         max_query_len, ubatch_slices,
-         num_tokens_after_padding) = self._prepare_inputs(scheduler_output)
+        num_reqs = self.input_batch.num_reqs
+        req_ids = self.input_batch.req_ids
+        tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
+        num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
+        max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
 
-      (
-          num_scheduled_tokens,
-          num_input_tokens,
-          num_tokens_across_dp,
-          input_ids,
-          inputs_embeds,
-          positions,
-          intermediate_tensors,
-          model_kwargs,
-      ) = self._preprocess(scheduler_output, intermediate_tensors,
-                           ubatch_slices, num_tokens_after_padding)
+        (logits_indices, spec_decode_metadata, ubatch_slices,
+         num_tokens_across_dp) = self._prepare_inputs(
+            scheduler_output, num_scheduled_tokens_np, max_num_scheduled_tokens)
 
-      uniform_decode = (max_query_len == self.uniform_decode_query_len) and (
-          num_scheduled_tokens == self.input_batch.num_reqs * max_query_len)
+        total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
+        attn_metadata, spec_decode_common_attn_metadata = (
+            self._build_attention_metadata(
+                total_num_scheduled_tokens=total_num_scheduled_tokens,
+                max_num_scheduled_tokens=max_num_scheduled_tokens,
+                num_reqs=num_reqs,
+                ubatch_slices=ubatch_slices,
+                logits_indices=logits_indices,
+                use_spec_decode=use_spec_decode,
+                scheduled_encoder_inputs=scheduler_output.scheduled_encoder_inputs,
+                cascade_attn_prefix_lens=None,
+            )
+        )
+
+        dp_rank = self.parallel_config.data_parallel_rank
+        if ubatch_slices:
+          assert num_tokens_across_dp is not None
+          num_input_tokens = int(num_tokens_across_dp[dp_rank].item())
+          self.pad_out_ubatch_slice(ubatch_slices, num_input_tokens)
+        elif num_tokens_across_dp is not None:
+          num_input_tokens = int(num_tokens_across_dp[dp_rank].item())
+        else:
+          num_input_tokens = self._get_num_input_tokens(total_num_scheduled_tokens)
+
+        (input_ids, inputs_embeds, positions, intermediate_tensors,
+         model_kwargs, _ec_connector_output) = self._preprocess(
+            scheduler_output, num_input_tokens, intermediate_tensors)
+
+      num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+      uniform_decode = (
+          max_num_scheduled_tokens == self.uniform_decode_query_len) and (
+          num_scheduled_tokens == num_reqs * max_num_scheduled_tokens)
       batch_descriptor = BatchDescriptor(
           num_tokens=num_input_tokens,
           uniform_decode=uniform_decode,
@@ -187,14 +214,8 @@ class GPUModelRunner(BaseGPUModelRunner):
         assert model_output_broadcast_data is not None
         logits = model_output_broadcast_data["logits"]
 
-      # Apply structured output bitmasks if present
-      if scheduler_output.grammar_bitmask is not None:
-        apply_grammar_bitmask(
-            scheduler_output,
-            self.input_batch,
-            logits,
-            self.device,
-        )
+      # Structured output bitmasks (grammar_bitmask) moved to sample_tokens()
+      # in vllm >= 0.11.2 and are no longer on SchedulerOutput directly.
 
     with record_function_or_nullcontext("Sample"):
       sampler_output: SamplerOutput = self._sample(logits, spec_decode_metadata)
@@ -249,6 +270,7 @@ class GPUModelRunner(BaseGPUModelRunner):
           logits,
           hidden_states,
           num_scheduled_tokens,
+          spec_decode_metadata,
       )
 
     if (self.speculative_config and not use_padded_batch_for_eagle and
@@ -289,6 +311,7 @@ class GPUModelRunner(BaseGPUModelRunner):
       logits: Optional[torch.Tensor],
       hidden_states: torch.Tensor,
       num_scheduled_tokens: int,
+      spec_decode_metadata=None,  # added in vllm >= 0.11.2
   ) -> tuple[
       dict[str, int],
       Optional[LogprobsLists],
@@ -352,7 +375,13 @@ class GPUModelRunner(BaseGPUModelRunner):
         )
       # Mask out the sampled tokens that should not be sampled.
       for i in discard_sampled_tokens_req_indices:
-        valid_sampled_token_ids[int(i)].clear()
+        # vllm >= 0.11.2: _to_list returns list[np.ndarray], not list[list[int]]
+        idx = int(i)
+        entry = valid_sampled_token_ids[idx]
+        if hasattr(entry, 'clear'):
+          entry.clear()
+        else:
+          valid_sampled_token_ids[idx] = entry[:0]
     else:
       valid_sampled_token_ids = []
       invalid_req_indices = discard_sampled_tokens_req_indices.tolist()

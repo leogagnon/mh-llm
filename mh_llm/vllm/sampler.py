@@ -27,17 +27,9 @@ class Sampler(BaseSampler):
 
     # Use float32 for the logits.
     logits = logits.to(torch.float32)
-    # Apply allowed token ids.
-    logits = self.apply_allowed_token_ids(logits, sampling_metadata)
-    # Apply bad words exclusion.
-    logits = self.apply_bad_words(logits, sampling_metadata)
-
-    # Apply logits processors which can impact greedy sampling
-    for processor in sampling_metadata.logitsprocs.non_argmax_invariant:
-      logits = processor.apply(logits)
-
-    # Apply penalties (e.g., min_tokens, freq_penalties).
-    logits = self.apply_penalties(logits, sampling_metadata)
+    # Apply allowed token ids, bad words, logits processors, and penalties.
+    # (vllm >= 0.11.2 consolidated these into apply_logits_processors)
+    logits = self.apply_logits_processors(logits, sampling_metadata, False)
 
     # 💎 MCMC new logic:
     # compute logprobs (don't apply temperature, let users apply temperature)

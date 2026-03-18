@@ -51,6 +51,10 @@ class Scheduler(BaseScheduler):
       req_index = model_runner_output.req_id_to_index[req_id]
       generated_token_ids = sampled_token_ids[
           req_index] if sampled_token_ids else []
+      # vllm >= 0.11.2 _to_list returns list[np.ndarray]; convert to list[int]
+      # so that append_output_token_ids receives plain Python ints.
+      if hasattr(generated_token_ids, 'tolist'):
+        generated_token_ids = generated_token_ids.tolist()
 
       scheduled_spec_token_ids = (
           scheduler_output.scheduled_spec_decode_tokens.get(req_id))

@@ -60,6 +60,7 @@ class RequestState(BaseRequestState):
       request_index: int,
       queue: RequestOutputCollector | None,
       log_stats: bool,
+      stream_interval: int = 1,  # added in vllm >= 0.11.2
   ) -> "RequestState":
     with mh_patch([{
         'module': 'vllm.v1.engine.output_processor',
@@ -73,6 +74,7 @@ class RequestState(BaseRequestState):
           request_index,
           queue,
           log_stats,
+          stream_interval=stream_interval,
       )
 
 

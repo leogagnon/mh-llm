@@ -70,6 +70,9 @@ class MHLLM:
   def generate(self, *args, **kwargs):
     return self.llm.generate(*args, **kwargs)
 
+  def collective_rpc(self, *args, **kwargs):
+    return self.llm.collective_rpc(*args, **kwargs)
+
   def _extract_logprobs(
       self,
       logprobs: list[dict[int, Logprob]],

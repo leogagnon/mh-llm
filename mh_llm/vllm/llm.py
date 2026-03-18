@@ -2,10 +2,16 @@ from typing import Any
 
 from vllm.config import (
     CompilationConfig,
-    ModelDType,
     StructuredOutputsConfig,
-    TokenizerMode,
 )
+try:
+    from vllm.config import ModelDType
+except ImportError:
+    from vllm.config.model import ModelDType  # vllm >= 0.11.2
+try:
+    from vllm.config import TokenizerMode
+except ImportError:
+    from vllm.engine.arg_utils import TokenizerMode  # vllm >= 0.11.2
 from vllm.engine.arg_utils import (
     ConvertOption,
     HfOverrides,
