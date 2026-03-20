@@ -89,22 +89,22 @@ class MHLLM:
 
   def _generate_intermediate_prompt(
       self,
-      prompt: str,
-      proposed_tokens: list[float],
-  ) -> str:
-    """Generate intermediate prompts by appending proposed tokens.
+      prompt_ids: list[int],
+      proposed_tokens: list[int],
+  ) -> dict:
+    """Build a vLLM token-IDs prompt by concatenating prompt and proposed tokens.
+
+    Working in token space avoids re-tokenizing text strings, which would
+    cause a double-BOS when the chat template already includes the BOS token.
 
     Args:
-        prompt (str): The original prompt.
-        proposed_tokens (list[float]): The proposed tokens to append.
+        prompt_ids (list[int]): Pre-tokenized prompt token IDs.
+        proposed_tokens (list[int]): Already-generated tokens to prepend as context.
 
     Returns:
-        str: The updated prompt with proposed tokens appended.
+        dict: A vLLM TokensPrompt dict {"prompt_token_ids": [...]}.
     """
-    return prompt + self.tokenizer.decode(
-        proposed_tokens,
-        skip_special_tokens=True,
-    )
+    return {"prompt_token_ids": prompt_ids + list(proposed_tokens)}
 
   def _mh_sample(
       self,
@@ -129,6 +129,12 @@ class MHLLM:
     Returns:
         str: The generated text output.
     """
+    # Pre-tokenize once with add_special_tokens=False to avoid double-BOS:
+    # the chat template already includes the BOS token in the string, so
+    # re-tokenizing with the default add_special_tokens=True would prepend
+    # an extra one on every vLLM call.
+    prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
+
     # override certain sampling parameter values
     sampling_params = copy.deepcopy(sampling_params)
     sampling_params.n = 1  # always generate 1 sample
@@ -141,10 +147,7 @@ class MHLLM:
     block_steps = (int(math.ceil(max_new_tokens / block_size) + 1))
     for k in range(0, block_steps):
       sampling_params.max_tokens = block_size
-      _prompt = self._generate_intermediate_prompt(
-          prompt,
-          output_tokens,
-      )
+      _prompt = self._generate_intermediate_prompt(prompt_ids, output_tokens)
       output = self.llm.generate(
           _prompt,
           sampling_params=sampling_params,
@@ -159,10 +162,7 @@ class MHLLM:
       for _ in range(num_mcmc_steps):
         # Propose new tokens starting from a randomly sampled position
         idx = random.randint(0, len(output_tokens) - 2)
-        mcmc_prompt = self._generate_intermediate_prompt(
-            prompt,
-            output_tokens[:idx],
-        )
+        mcmc_prompt = self._generate_intermediate_prompt(prompt_ids, output_tokens[:idx])
         sampling_params.max_tokens = len(output_tokens) - idx
         mcmc_output = self.llm.generate(
             mcmc_prompt,
@@ -248,6 +248,11 @@ class MHLLM:
         logprobs=1,
     )
 
+    # Pre-tokenize all prompts once with add_special_tokens=False
+    prompts_ids = [
+        self.tokenizer.encode(p, add_special_tokens=False) for p in prompts
+    ]
+
     remaining_prompt_idx = list(range(len(prompts)))
 
     output_tokens = [[] for _ in prompts]
@@ -264,7 +269,7 @@ class MHLLM:
       for k in range(0, block_steps):
         _prompts = [
             self._generate_intermediate_prompt(
-                prompts[i],
+                prompts_ids[i],
                 output_tokens[i],
             ) for i in remaining_prompt_idx
         ]
@@ -298,7 +303,7 @@ class MHLLM:
           ]
           mcmc_prompts = [
               self._generate_intermediate_prompt(
-                  prompts[i],
+                  prompts_ids[i],
                   output_tokens[i][:idx_list[batch_idx]],
               ) for batch_idx, i in enumerate(remaining_prompt_idx)
           ]
